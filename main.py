@@ -4,10 +4,12 @@ Serves stock data, manages watchlists via Supabase, handles auth.
 """
 
 import os
+import time
 import logging
 from datetime import datetime
 from typing import Optional
 
+import yfinance as yf
 from fastapi import FastAPI, HTTPException, Depends, Header
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -21,7 +23,6 @@ from stock_data import (
     get_fx_cache,
     fetch_fx_rates,
     usd_to,
-    get_sector,
     CURRENCIES,
 )
 
@@ -252,7 +253,7 @@ def remove_from_watchlist(symbol: str, user_id: str = Depends(get_user_id)):
 
 # ── Routes: Discover feed ─────────────────────────────────────────────────────
 
-# Common stocks by sector for basic recommendations
+# Hardcoded sector→tickers map (avoids calling get_sector() at runtime)
 SECTOR_TICKERS = {
     "Technology": ["AAPL", "MSFT", "GOOGL", "META", "NVDA", "AMD", "CRM",
                    "INTC", "ADBE", "ORCL", "PLTR", "CRWD", "SNOW", "NET"],
@@ -268,22 +269,56 @@ SECTOR_TICKERS = {
                                 "T", "VZ", "TMUS", "SNAP", "PINS"],
 }
 
+# Reverse lookup: ticker → sector (built once at import time)
+TICKER_SECTOR: dict[str, str] = {}
+for _sector, _tickers in SECTOR_TICKERS.items():
+    for _t in _tickers:
+        TICKER_SECTOR[_t] = _sector
+
+FALLBACK_TICKERS = ["AMD", "PLTR", "SMCI", "MARA", "CRWD", "COIN",
+                    "SOFI", "RIVN", "LCID", "RKLB"]
+
 REASON_TEMPLATES = {
     "sector": "Because you hold {held} \u2014 same sector",
     "trending": "Trending on Reddit right now",
-    "momentum": "Up {pct}% this month",
-    "analyst": "Analyst consensus: {consensus}",
+    "momentum": "Up {pct}% today",
 }
+
+_discover_cache: dict[str, dict] = {}  # user_id → cached response
+_discover_cache_time: dict[str, float] = {}  # user_id → epoch seconds
+DISCOVER_CACHE_TTL = 300  # 5 minutes
+
+
+def _fetch_discover_item(ticker: str) -> dict | None:
+    """Fetch only price + day change via fast_info. Returns None on error."""
+    try:
+        fi = yf.Ticker(ticker).fast_info
+        price = float(fi.last_price)
+        prev = float(fi.previous_close)
+        change = round(price - prev, 2)
+        change_pct = round((price - prev) / prev * 100, 2)
+        return {
+            "symbol": ticker,
+            "price": round(price, 2),
+            "change_day": change,
+            "change_day_pct": change_pct,
+        }
+    except Exception:
+        return None
 
 
 @app.get("/api/discover")
 def get_discover(user_id: str = Depends(get_user_id)):
     """
-    Return personalized stock recommendations based on user's watchlist.
-    Basic v1: find the sectors of held stocks, suggest others in same sectors.
+    Return personalized stock recommendations based on user's watchlist sectors.
+    Results are cached per user for 5 minutes.
     """
+    now = time.time()
+    if (user_id in _discover_cache
+            and now - _discover_cache_time.get(user_id, 0) < DISCOVER_CACHE_TTL):
+        return _discover_cache[user_id]
+
     try:
-        # Get user's current watchlist
         current = (
             supabase_admin.table("watchlists")
             .select("symbols")
@@ -295,94 +330,64 @@ def get_discover(user_id: str = Depends(get_user_id)):
     except Exception:
         held = set()
 
-    recommendations = []
-
-    # Find sectors the user is invested in
-    user_sectors = {}
+    # Determine user sectors using hardcoded map (no network calls)
+    user_sectors: dict[str, list[str]] = {}
     for sym in held:
-        sector = get_sector(sym)
-        if sector != "Unknown":
+        sector = TICKER_SECTOR.get(sym)
+        if sector:
             user_sectors.setdefault(sector, []).append(sym)
 
-    # Suggest stocks from the same sectors that the user doesn't already hold
+    recommendations = []
     seen = set(held)
+
+    # Sector-matched candidates
     for sector, held_in_sector in user_sectors.items():
-        candidates = SECTOR_TICKERS.get(sector, [])
-        for ticker in candidates:
-            if ticker in seen:
+        for ticker in SECTOR_TICKERS.get(sector, []):
+            if ticker in seen or len(recommendations) >= 10:
                 continue
             seen.add(ticker)
-
-            data = fetch_stock_data(ticker)
-            if data.get("error"):
+            item = _fetch_discover_item(ticker)
+            if item is None:
                 continue
-
-            # Determine the best reason to show
-            reason = REASON_TEMPLATES["sector"].format(held=held_in_sector[0])
             reason_type = "sector"
-
-            # Override with momentum if strong
-            if data.get("change_week_pct") and data["change_week_pct"] > 5:
-                reason = REASON_TEMPLATES["momentum"].format(
-                    pct=round(data["change_week_pct"], 1))
+            reason = REASON_TEMPLATES["sector"].format(held=held_in_sector[0])
+            if item["change_day_pct"] > 3:
                 reason_type = "momentum"
-
-            # Override with consensus if strong buy
-            if data.get("consensus") in ("Strong Buy", "Buy"):
-                reason = REASON_TEMPLATES["analyst"].format(
-                    consensus=data["consensus"])
-                reason_type = "analyst"
-
-            recommendations.append({
-                **data,
-                "reason": reason,
-                "reason_type": reason_type,
-            })
-
-            # Cap at 15 recommendations to keep response fast
-            if len(recommendations) >= 15:
-                break
-
-        if len(recommendations) >= 15:
+                reason = REASON_TEMPLATES["momentum"].format(
+                    pct=round(item["change_day_pct"], 1))
+            recommendations.append({**item, "reason": reason, "reason_type": reason_type})
+        if len(recommendations) >= 10:
             break
 
-    # Fill remaining slots with trending/popular if we have < 10
-    fallback_tickers = ["AMD", "PLTR", "SMCI", "MARA", "CRWD", "COIN",
-                        "SOFI", "RIVN", "LCID", "RKLB"]
-    if len(recommendations) < 10:
-        for ticker in fallback_tickers:
-            if ticker in seen:
-                continue
-            seen.add(ticker)
+    # Fill remaining slots with fallback trending tickers
+    for ticker in FALLBACK_TICKERS:
+        if len(recommendations) >= 10:
+            break
+        if ticker in seen:
+            continue
+        seen.add(ticker)
+        item = _fetch_discover_item(ticker)
+        if item is None:
+            continue
+        recommendations.append({
+            **item,
+            "reason": REASON_TEMPLATES["trending"],
+            "reason_type": "trending",
+        })
 
-            data = fetch_stock_data(ticker)
-            if data.get("error"):
-                continue
-
-            recommendations.append({
-                **data,
-                "reason": "Trending on Reddit right now",
-                "reason_type": "trending",
-            })
-
-            if len(recommendations) >= 15:
-                break
-
-    # Sort: momentum stocks first, then sector matches, then trending
-    priority = {"momentum": 0, "analyst": 1, "sector": 2, "trending": 3}
+    priority = {"momentum": 0, "sector": 1, "trending": 2}
     recommendations.sort(key=lambda r: priority.get(r["reason_type"], 99))
 
-    # Build sector breakdown for the personalization banner
     total = len(held) or 1
     sector_pcts = {
         sector: round(len(syms) / total * 100)
         for sector, syms in user_sectors.items()
     }
 
-    return {
-        "recommendations": recommendations,
-        "portfolio_breakdown": sector_pcts,
-    }
+    result = {"recommendations": recommendations, "portfolio_breakdown": sector_pcts}
+    _discover_cache[user_id] = result
+    _discover_cache_time[user_id] = now
+    return result
 
 
 # ══════════════════════════════════════════════════════════════════════════════
