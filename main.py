@@ -253,40 +253,56 @@ def remove_from_watchlist(symbol: str, user_id: str = Depends(get_user_id)):
 
 # ── Routes: Discover feed ─────────────────────────────────────────────────────
 
-# Hardcoded sector→tickers map (avoids calling get_sector() at runtime)
 SECTOR_TICKERS = {
     "Technology": ["AAPL", "MSFT", "GOOGL", "META", "NVDA", "AMD", "CRM",
                    "INTC", "ADBE", "ORCL", "PLTR", "CRWD", "SNOW", "NET"],
     "Healthcare": ["JNJ", "UNH", "PFE", "ABBV", "MRK", "LLY", "TMO",
-                   "ABT", "BMY", "AMGN"],
+                   "ABT", "BMY", "AMGN", "ISRG", "REGN", "VRTX", "MRNA"],
     "Financial Services": ["JPM", "BAC", "GS", "MS", "V", "MA", "BLK",
-                           "C", "WFC", "AXP"],
+                           "C", "WFC", "AXP", "SCHW", "CB", "PGR", "TFC"],
     "Consumer Cyclical": ["AMZN", "TSLA", "HD", "NKE", "MCD", "SBUX",
-                          "TGT", "LOW", "BKNG", "CMG"],
+                          "TGT", "LOW", "BKNG", "CMG", "LULU", "DECK",
+                          "CROX", "RH"],
+    "Consumer Defensive": ["WMT", "COST", "PG", "KO", "PEP", "CL",
+                           "PM", "MDLZ", "KHC", "GIS", "SYY", "MKC"],
     "Energy": ["XOM", "CVX", "COP", "SLB", "EOG", "MPC", "PSX",
-               "OXY", "VLO", "DVN"],
+               "OXY", "VLO", "DVN", "HAL", "BKR"],
     "Communication Services": ["GOOGL", "META", "DIS", "NFLX", "CMCSA",
-                                "T", "VZ", "TMUS", "SNAP", "PINS"],
+                                "T", "VZ", "TMUS", "SNAP", "PINS",
+                                "SPOT", "WBD"],
+    "Industrials": ["CAT", "DE", "UPS", "HON", "BA", "GE", "RTX",
+                    "LMT", "MMM", "EMR", "FDX", "NSC", "ETN", "PH"],
+    "Real Estate": ["AMT", "PLD", "EQIX", "SPG", "O", "DLR",
+                    "WELL", "PSA", "AVB", "ARE", "CBRE", "IRM"],
 }
 
-# Reverse lookup: ticker → sector (built once at import time)
-TICKER_SECTOR: dict[str, str] = {}
-for _sector, _tickers in SECTOR_TICKERS.items():
-    for _t in _tickers:
-        TICKER_SECTOR[_t] = _sector
-
-FALLBACK_TICKERS = ["AMD", "PLTR", "SMCI", "MARA", "CRWD", "COIN",
-                    "SOFI", "RIVN", "LCID", "RKLB"]
+FALLBACK_TICKERS = ["PLTR", "SMCI", "MARA", "COIN", "SOFI", "RIVN", "LCID", "RKLB",
+                    "IONQ", "WOLF"]
 
 REASON_TEMPLATES = {
     "sector": "Because you hold {held} \u2014 same sector",
-    "trending": "Trending on Reddit right now",
+    "trending": "Trending right now",
     "momentum": "Up {pct}% today",
 }
 
-_discover_cache: dict[str, dict] = {}  # user_id → cached response
-_discover_cache_time: dict[str, float] = {}  # user_id → epoch seconds
+_discover_cache: dict[str, dict] = {}
+_discover_cache_time: dict[str, float] = {}
 DISCOVER_CACHE_TTL = 300  # 5 minutes
+
+# Persistent sector cache so yfinance lookups aren't repeated across requests
+_sector_cache: dict[str, str] = {}
+
+
+def _lookup_sector(symbol: str) -> str:
+    """Return the sector for a ticker, using yfinance with a persistent cache."""
+    if symbol in _sector_cache:
+        return _sector_cache[symbol]
+    try:
+        sector = yf.Ticker(symbol).info.get("sector", "Unknown") or "Unknown"
+    except Exception:
+        sector = "Unknown"
+    _sector_cache[symbol] = sector
+    return sector
 
 
 def _fetch_discover_item(ticker: str) -> dict | None:
@@ -323,8 +339,9 @@ def _fetch_discover_item(ticker: str) -> dict | None:
 @app.get("/api/discover")
 def get_discover(user_id: str = Depends(get_user_id)):
     """
-    Return personalized stock recommendations based on user's watchlist sectors.
-    Results are cached per user for 5 minutes.
+    Return personalized stock recommendations based on every stock in the user's
+    watchlist. Sector lookups are cached; discover results are cached per user
+    for 5 minutes.
     """
     now = time.time()
     if (user_id in _discover_cache
@@ -346,34 +363,59 @@ def get_discover(user_id: str = Depends(get_user_id)):
     if not held:
         return {"recommendations": [], "portfolio_breakdown": {}, "needs_onboarding": True}
 
-    # Determine user sectors using hardcoded map (no network calls)
-    user_sectors: dict[str, list[str]] = {}
+    # Look up sector for every held stock via yfinance (cached across requests)
+    # sym_sector maps each held ticker → its sector
+    sym_sector: dict[str, str] = {}
     for sym in held:
-        sector = TICKER_SECTOR.get(sym)
-        if sector:
-            user_sectors.setdefault(sector, []).append(sym)
+        sector = _lookup_sector(sym)
+        if sector != "Unknown":
+            sym_sector[sym] = sector
+
+    # sector → list of held tickers in that sector (for breakdown + reason labels)
+    user_sectors: dict[str, list[str]] = {}
+    for sym, sector in sym_sector.items():
+        user_sectors.setdefault(sector, []).append(sym)
+
+    # Build a round-robin candidate queue: one ticker per sector per pass so
+    # recommendations are spread across ALL the user's sectors.
+    seen = set(held)
+    # candidate_queue: list of (ticker, held_ticker_that_triggered_it, sector)
+    candidate_queue: list[tuple[str, str, str]] = []
+    sector_iters = {
+        sector: iter(SECTOR_TICKERS.get(sector, []))
+        for sector in user_sectors
+    }
+    active_sectors = list(user_sectors.keys())
+    while active_sectors:
+        exhausted = []
+        for sector in active_sectors:
+            held_in_sector = user_sectors[sector]
+            try:
+                ticker = next(sector_iters[sector])
+                if ticker not in seen:
+                    seen.add(ticker)
+                    # attribute to the first held stock in this sector
+                    candidate_queue.append((ticker, held_in_sector[0], sector))
+            except StopIteration:
+                exhausted.append(sector)
+        for s in exhausted:
+            active_sectors.remove(s)
 
     recommendations = []
-    seen = set(held)
-
-    # Sector-matched candidates
-    for sector, held_in_sector in user_sectors.items():
-        for ticker in SECTOR_TICKERS.get(sector, []):
-            if ticker in seen or len(recommendations) >= 10:
-                continue
-            seen.add(ticker)
-            item = _fetch_discover_item(ticker)
-            if item is None:
-                continue
-            reason_type = "sector"
-            reason = REASON_TEMPLATES["sector"].format(held=held_in_sector[0])
-            if item["change_day_pct"] > 3:
-                reason_type = "momentum"
-                reason = REASON_TEMPLATES["momentum"].format(
-                    pct=round(item["change_day_pct"], 1))
-            recommendations.append({**item, "reason": reason, "reason_type": reason_type})
+    for ticker, held_sym, _ in candidate_queue:
         if len(recommendations) >= 10:
             break
+        item = _fetch_discover_item(ticker)
+        if item is None:
+            continue
+        if item["change_day_pct"] > 3:
+            reason_type = "momentum"
+            reason = REASON_TEMPLATES["momentum"].format(
+                pct=round(item["change_day_pct"], 1))
+        else:
+            reason_type = "sector"
+            reason = REASON_TEMPLATES["sector"].format(held=held_sym)
+        recommendations.append({**item, "reason": reason, "reason_type": reason_type})
 
     # Fill remaining slots with fallback trending tickers
     for ticker in FALLBACK_TICKERS:
