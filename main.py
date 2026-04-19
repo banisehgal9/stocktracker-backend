@@ -147,10 +147,10 @@ def get_watchlist(user_id: str = Depends(get_user_id)):
         if result.data and len(result.data) > 0:
             return result.data[0]
         
-        # No watchlist exists — create one with defaults
+        # No watchlist exists — create one with empty symbols (onboarding fills it)
         new = (
             supabase_admin.table("watchlists")
-            .insert({"user_id": user_id, "symbols": ["AAPL", "TSLA", "NVDA", "MSFT"], "currency": "CAD"})
+            .insert({"user_id": user_id, "symbols": [], "currency": "CAD"})
             .execute()
         )
         return new.data[0]
@@ -342,6 +342,9 @@ def get_discover(user_id: str = Depends(get_user_id)):
         held = set(current.data.get("symbols", []))
     except Exception:
         held = set()
+
+    if not held:
+        return {"recommendations": [], "portfolio_breakdown": {}, "needs_onboarding": True}
 
     # Determine user sectors using hardcoded map (no network calls)
     user_sectors: dict[str, list[str]] = {}
