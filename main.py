@@ -290,18 +290,31 @@ DISCOVER_CACHE_TTL = 300  # 5 minutes
 
 
 def _fetch_discover_item(ticker: str) -> dict | None:
-    """Fetch only price + day change via fast_info. Returns None on error."""
+    """Fetch price, day change, and 30-day history for sparklines. No news/Reddit."""
     try:
-        fi = yf.Ticker(ticker).fast_info
+        t = yf.Ticker(ticker)
+        fi = t.fast_info
         price = float(fi.last_price)
         prev = float(fi.previous_close)
         change = round(price - prev, 2)
         change_pct = round((price - prev) / prev * 100, 2)
+
+        history_30d = []
+        try:
+            h = t.history(period="1mo")
+            history_30d = [
+                {"date": d.strftime("%Y-%m-%d"), "close": round(float(c), 2)}
+                for d, c in zip(h.index, h["Close"])
+            ]
+        except Exception:
+            pass
+
         return {
             "symbol": ticker,
             "price": round(price, 2),
             "change_day": change,
             "change_day_pct": change_pct,
+            "history_30d": history_30d,
         }
     except Exception:
         return None
