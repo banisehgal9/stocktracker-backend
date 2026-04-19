@@ -263,35 +263,36 @@ def fetch_latest_news(symbol: str) -> list:
 # ══════════════════════════════════════════════════════════════════════════════
 
 def fetch_reddit_buzz(symbol: str) -> str:
+    """Fetch Reddit mentions via RSS (no auth required, works server-side)."""
     buzz = []
     sym = symbol.upper()
     for sub in ["stocks", "investing", "wallstreetbets"]:
-        url = (f"https://www.reddit.com/r/{sub}/search.json"
-               f"?q={sym}&sort=new&limit=5&restrict_sr=1")
+        url = f"https://www.reddit.com/r/{sub}/search.rss?q={sym}&sort=new&restrict_sr=1"
         try:
             req = urllib.request.Request(url, headers={
-                "User-Agent": "StockTracker/1.0"
+                "User-Agent": ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                               "AppleWebKit/537.36 (KHTML, like Gecko) "
+                               "Chrome/120.0.0.0 Safari/537.36"),
+                "Accept": "application/rss+xml, application/xml, text/xml",
             })
-            with urllib.request.urlopen(req, timeout=5) as r:
-                data = json.loads(r.read())
-            for p in data.get("data", {}).get("children", []):
-                pd = p.get("data", {})
-                title = pd.get("title", "")
-                ups = pd.get("ups", 0)
-                if title and ups > 5:
-                    buzz.append({"upvotes": ups, "title": title,
-                                 "subreddit": sub})
+            with urllib.request.urlopen(req, timeout=6) as r:
+                root = ET.fromstring(r.read())
+            for entry in root.findall(".//{http://www.w3.org/2005/Atom}entry")[:3]:
+                title = (entry.findtext("{http://www.w3.org/2005/Atom}title") or "").strip()
+                link_el = entry.find("{http://www.w3.org/2005/Atom}link")
+                link = link_el.get("href", "") if link_el is not None else ""
+                if title:
+                    buzz.append({"title": title, "link": link, "subreddit": sub})
         except Exception:
             pass
 
     if not buzz:
         return f"No notable Reddit discussion found for ${sym} recently."
 
-    buzz.sort(key=lambda x: x["upvotes"], reverse=True)
     parts = []
     for b in buzz[:2]:
         short = b["title"][:90] + "\u2026" if len(b["title"]) > 90 else b["title"]
-        parts.append(f'r/{b["subreddit"]}: "{short}" ({b["upvotes"]} upvotes)')
+        parts.append(f'r/{b["subreddit"]}: "{short}"')
     return "  \u2022  ".join(parts)
 
 
